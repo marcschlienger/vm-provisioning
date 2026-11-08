@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # agent-vm.sh — create or re-enter a PERSISTENT agent VM
-# (Claude Code / Codex / Pi).
+# (Claude Code / Codex / T3 Code).
 #
 # Usage:
 #   ./agent-vm.sh <task-name> [--git <repo-name-or-path>]

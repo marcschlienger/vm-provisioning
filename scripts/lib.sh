@@ -324,8 +324,8 @@ verify_workspace_bootstrap() {
     return 1
   fi
   if ! incus exec "$instance" -- /usr/local/sbin/verify-agent-clis >/dev/null; then
-    echo "ERROR: '$instance' failed the agent CLI contract (Node 22, Claude, Codex, Pi)." >&2
-    echo "       Rebuild images for Node/Claude; rerun the instance installers for Codex/Pi." >&2
+    echo "ERROR: '$instance' failed the agent CLI contract (Claude, Codex, T3 Code)." >&2
+    echo "       Rebuild images for Claude; rerun the instance installers for Codex/T3 Code." >&2
     return 1
   fi
 }

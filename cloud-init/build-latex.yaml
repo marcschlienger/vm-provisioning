@@ -1,7 +1,7 @@
 #cloud-config
 # =============================================================================
-# LaTeX image build — runs on top of ubuntu-agents so workspaces inherit Node,
-# native Claude, and the Codex/Pi first-boot installers.
+# LaTeX image build — runs on top of ubuntu-agents so workspaces inherit
+# native Claude and the Codex/T3 Code first-boot installers.
 # texlive-full is ~5 GB and takes 20–40 min to install; this is expected.
 # =============================================================================
 
@@ -27,8 +27,8 @@ runcmd:
 
   - apt-get clean && rm -rf /var/lib/apt/lists/*
 
-  # Validate only what is deliberately baked into the image. Codex and Pi are
-  # installed and fully checked in each workspace VM during first boot.
+  # Validate only what is deliberately baked into the image. Codex and T3 Code
+  # are installed and fully checked in each workspace VM during first boot.
   - /usr/local/sbin/verify-agent-clis --prerequisites
 
 final_message: "LaTeX image build complete."

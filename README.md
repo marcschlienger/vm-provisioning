@@ -1,31 +1,64 @@
-# Home Server Provisioning
+# VM Provisioning
 
-Incus-based provisioning for a personal Ubuntu Server 26.04 home server.
+Incus-based provisioning for persistent VMs and one system container on a
+personal Ubuntu Server 26.04 host.
 
-**Workloads:** Nextcloud AIO (on host via Docker), JupyterHub (Incus system
-container), Ollama + OpenWebUI (Incus VM), persistent LaTeX workspace (Incus
-VM), persistent agent sandboxes (Incus VMs with Claude Code / Codex / Pi).
+**Workloads:** JupyterHub (Incus system container), Ollama + OpenWebUI (Incus
+VM), persistent LaTeX workspace (Incus VM), persistent agent sandboxes (Incus
+VMs with Claude Code / Codex / T3 Code).
 
-The NVMe uses separate LVM filesystems for the host and Incus. This is a
-deliberate availability boundary: a VM image build can fill the Incus
-filesystem without preventing Caddy, Docker, or the host from writing to `/`.
+The host setup — storage layout, Tailscale, Docker, Caddy, Nextcloud, backups —
+is a separate repository, `home-server-provisioning`.
+
+## Where this repository meets `home-server-provisioning`
+
+The two repositories share no code or configuration. They touch at four points:
+
+- **`/srv/incus`** — the dedicated filesystem. `home-server-provisioning`
+  creates it as a logical volume; this repository uses it as the Incus
+  storage-pool source.
+- **Docker and Incus on one host** — Docker's forwarding policy blocks Incus
+  guests. [`scripts/install-incus-docker-forwarding.sh`](./scripts/install-incus-docker-forwarding.sh)
+  installs the exception.
+- **Caddy to OpenWebUI** — the Caddyfile in `home-server-provisioning` proxies
+  to the address of the Ollama VM that this repository creates.
+- **`GIT_REPOS_ROOT`** — the host repository directory that this repository
+  mounts into VMs and that the host's backups include.
 
 ## Start here
 
-- **[`SETUP.md`](./SETUP.md)** — full architecture, disaster-recovery
-  bootstrap path, day-to-day usage, troubleshooting, file layout reference.
-- **[`compose/nextcloud-aio.compose.yaml`](./compose/nextcloud-aio.compose.yaml)** —
-  Nextcloud AIO mastercontainer Compose file.
-- **[`PROJECT_REVIEW.md`](./PROJECT_REVIEW.md)** — current static review,
-  accepted tradeoffs, and residual verification limits.
+- **[`SETUP.md`](./SETUP.md)** — Incus, image builds, workspace VMs, day-to-day
+  usage, troubleshooting, file layout reference.
+- **[`PROJECT_REVIEW.md`](./PROJECT_REVIEW.md)** — static review, accepted
+  tradeoffs, and residual verification limits.
 - **[`scripts/teaching-vm.sh`](./scripts/teaching-vm.sh)** — persistent teaching
   workspace with separate public/private repositories and personal TEXMF.
-- **[`config.env`](./config.env)** — tracked defaults (resource sizes,
-  image names, repository roots, and teaching-workspace inputs).
+- **[`config.env`](./config.env)** — tracked defaults (resource sizes, image
+  names, repository roots, and teaching-workspace inputs).
+- **[`MIGRATION.md`](./MIGRATION.md)** — one-time steps when moving from an
+  earlier layout or tool set.
 - **[`LICENSE`](./LICENSE)** — MIT License.
 - **`config.env.local`** (you create it; gitignored) — local values such as the
   real dotfiles repo URL or a Jupyter Tailscale auth key. Launch and build
   scripts source it after `config.env`, so its values override the defaults.
+
+## Getting the repository onto a host
+
+The runbook assumes this repository is on the machine it configures. Put it
+there by whichever path you prefer:
+
+```bash
+# Option A — clone from your git server (Codeberg / GitHub / GitLab / private):
+cd ~/
+git clone <your-URL-for-this-repo> vm-provisioning
+cd vm-provisioning
+
+# Option B — rsync from your workstation if you keep it locally:
+rsync -av ~/path/to/vm-provisioning/ user@server:~/vm-provisioning/
+```
+
+The point is just "make these files available on the server." Git is the
+clean path; rsync works fine if you don't want to publish this anywhere.
 
 ## Quick verification
 
@@ -33,7 +66,6 @@ After cloning, sanity-check the cloud-init templates locally:
 
 ```bash
 shellcheck -x scripts/*.sh systemd/incus-docker-forward
-docker compose -f compose/nextcloud-aio.compose.yaml config
 ./scripts/validate-cloud-init.sh
 bash -n scripts/*.sh
 ```

@@ -1,14 +1,14 @@
 #cloud-config
 # =============================================================================
 # Agents image build — runs on top of ubuntu-base.
-# Installs the stable prerequisites shared by agent workspaces: Node.js 22 and
-# Claude Code. Codex and Pi are installed once in each VM's writable filesystem
-# during first boot so their runtime files never cross an image boundary.
+# Installs the stable prerequisite shared by agent workspaces: Claude Code. Codex
+# and T3 Code are installed once in each VM's writable filesystem during first
+# boot so their runtime files never cross an image boundary.
 # =============================================================================
 
 write_files:
   # These small installer scripts are baked into the image; the downloaded
-  # Codex and Pi payloads are not. launch-init runs each installer once.
+  # Codex and T3 Code payloads are not. launch-init runs each installer once.
   - path: /usr/local/sbin/install-codex-cli
     permissions: '0755'
     content: |
@@ -28,25 +28,45 @@ write_files:
         CODEX_NON_INTERACTIVE=1 \
         sh "$installer"
 
-  - path: /usr/local/sbin/install-pi-cli
+  - path: /usr/local/sbin/install-t3-code
     permissions: '0755'
     content: |
       #!/bin/sh
       set -eu
 
-      # npm upgrades a global package by first renaming its existing directory
-      # to a hidden, randomly suffixed sibling. A stale sibling from an
-      # interrupted install makes that rename fail with ENOTEMPTY. Remove only
-      # Pi's executable, package, and npm staging siblings so this installer is
-      # safe both after a partial first boot and with an older parent image.
-      rm -f /usr/local/bin/pi
-      rm -rf /usr/local/lib/node_modules/@earendil-works/pi-coding-agent
-      rm -rf /usr/local/lib/node_modules/@earendil-works/.pi-coding-agent-*
-
-      installer=$(mktemp /run/pi-install.XXXXXX)
+      # Install the T3 Code CLI for the fixed workspace user and run its server
+      # as a system service. The release archive is self-contained. Everything
+      # lives under the user's ~/.t3 and ~/.local/bin, which keeps `t3 update`
+      # free of root. The unit listens on all of the VM's interfaces; its only
+      # non-loopback interface is the host-private Incus bridge, so the server is
+      # reached from the host (scripts/t3-expose.sh puts it on the tailnet) or
+      # through an SSH tunnel to loopback. Safe to rerun: the installer reuses an
+      # existing download.
+      installer=$(mktemp /run/t3-install.XXXXXX)
       trap 'rm -f "$installer"' EXIT HUP INT TERM
-      curl -fsSL https://pi.dev/install.sh -o "$installer"
-      NPM_CONFIG_PREFIX=/usr/local TERM=dumb sh "$installer"
+      curl -fsSL https://t3.codes/install.sh -o "$installer"
+      chown admin:admin "$installer"
+      sudo -u admin env HOME=/home/admin sh "$installer"
+
+      cat > /etc/systemd/system/t3code.service <<'UNIT'
+      [Unit]
+      Description=T3 Code server
+      After=network.target
+
+      [Service]
+      Type=simple
+      User=admin
+      WorkingDirectory=/home/admin
+      ExecStart=/home/admin/.local/bin/t3 serve --host 0.0.0.0 --port 3773
+      Restart=on-failure
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+      UNIT
+
+      systemctl daemon-reload
+      systemctl enable --now t3code.service
 
   # One executable checks image prerequisites during builds and the complete
   # agent stack after first boot and on later re-entry.
@@ -62,46 +82,37 @@ write_files:
         *) echo "Usage: $0 [--prerequisites]" >&2; exit 2 ;;
       esac
 
-      for command_name in node npm claude timeout; do
+      for command_name in claude timeout; do
         if ! command -v "$command_name" >/dev/null 2>&1; then
           echo "ERROR: missing required command: $command_name" >&2
           exit 1
         fi
       done
-
-      echo "==> Verifying Node.js 22"
-      node -e 'process.exit(process.versions.node.split(".")[0] === "22" ? 0 : 1)'
 
       echo "==> Verifying Claude Code"
       timeout 30 claude --version
 
       [ "$prerequisites_only" = false ] || exit 0
 
-      for command_name in codex pi; do
-        if ! command -v "$command_name" >/dev/null 2>&1; then
-          echo "ERROR: missing required command: $command_name" >&2
-          exit 1
-        fi
-      done
+      if ! command -v codex >/dev/null 2>&1; then
+        echo "ERROR: missing required command: codex" >&2
+        exit 1
+      fi
 
       echo "==> Verifying Codex"
       timeout 30 codex --version
 
-      echo "==> Verifying Pi"
-      pi_version=$(timeout 30 pi --version)
-      case "$pi_version" in
-        [0-9]*.[0-9]*.[0-9]*) ;;
-        *) echo "Unexpected Pi version: $pi_version" >&2; exit 1 ;;
-      esac
-      printf '%s\n' "$pi_version"
+      # T3 Code is installed for the workspace user, so run it as that user.
+      if [ ! -x /home/admin/.local/bin/t3 ]; then
+        echo "ERROR: missing required command: /home/admin/.local/bin/t3" >&2
+        exit 1
+      fi
+
+      echo "==> Verifying T3 Code"
+      timeout 30 sudo -u admin -H /home/admin/.local/bin/t3 --version
 
 runcmd:
   - set -e
-
-  # Use Ubuntu 26.04's Node 22 packages for Pi. Remove any NodeSource state
-  # inherited from an older base image first: apt will not otherwise replace
-  # Node 24 with Ubuntu's lower-versioned package.
-  - rm -f /etc/apt/sources.list.d/nodesource.list /etc/apt/sources.list.d/nodesource.sources /etc/apt/keyrings/nodesource.gpg /usr/share/keyrings/nodesource.gpg
 
   # Claude Code CLI (Anthropic). Use the signed stable apt channel: it is
   # system-wide, native, and intentionally skips releases with major regressions.
@@ -113,12 +124,11 @@ runcmd:
   - echo 'deb [signed-by=/etc/apt/keyrings/claude-code.asc] https://downloads.claude.ai/claude-code/apt/stable stable main' > /etc/apt/sources.list.d/claude-code.list
 
   - apt-get update
-  - apt-get purge -y nodejs npm
-  - apt-get install -y nodejs npm claude-code
+  - apt-get install -y claude-code
 
   - apt-get clean && rm -rf /var/lib/apt/lists/*
 
-  # Codex and Pi are intentionally absent until a workspace VM's first boot.
+  # Codex and T3 Code are intentionally absent until a workspace VM's first boot.
   - /usr/local/sbin/verify-agent-clis --prerequisites
 
 final_message: "Agents image build complete."

@@ -11,7 +11,7 @@
 #   1. Ensure the fixed admin VM login user exists
 #   2. Enable password SSH for that user (admin/admin)
 #   3. Clone + apply dotfiles
-#   4. Install Codex and Pi once in the VM's writable filesystem
+#   4. Install Codex and T3 Code once in the VM's writable filesystem
 #
 # Placeholders substituted by the launch scripts before launch:
 #   __DOTFILES_REPO__    git URL of dotfiles repo (may be empty)
@@ -88,10 +88,11 @@ runcmd:
   - test -d /home/admin/.dotfiles
 
   # ── Per-instance agent CLIs ────────────────────────────────────────────────
-  # These payloads live only in the VM's writable filesystem. Keeping them out
-  # of published images avoids the observed Codex/Pi image-boundary failures.
+  # These payloads live only in the VM's writable filesystem. A standalone Codex
+  # binary that crossed the image-publish boundary crashed with a segmentation
+  # fault, so no downloaded payload is baked into a published image.
   - /usr/local/sbin/install-codex-cli
-  - /usr/local/sbin/install-pi-cli
+  - /usr/local/sbin/install-t3-code
   - /usr/local/sbin/verify-agent-clis
 
 final_message: "Launch-init complete."

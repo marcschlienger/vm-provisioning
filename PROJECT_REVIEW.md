@@ -1,47 +1,39 @@
 # Project Review
 
-Review date: 2026-08-29
+What the static checks cover, what they cannot prove, and the tradeoffs this
+repository accepts. Run the checks with:
 
-Scope reviewed:
-- `README.md`
-- `SETUP.md`
-- `config.env`
-- `.gitignore`
-- `.gitattributes`
-- `compose/nextcloud-aio.compose.yaml`
-- `cloud-init/*.yaml`
-- `cloud-init/*.tpl`
-- `scripts/*.sh`
-- hidden local files in the project directory
+```bash
+shellcheck -x scripts/*.sh systemd/incus-docker-forward
+bash -n scripts/*.sh
+./scripts/validate-cloud-init.sh
+```
 
-Checks run:
-- `shellcheck -x scripts/*.sh systemd/incus-docker-forward` passed.
-- The Compose file and documented Incus preseed both passed YAML parsing.
-  `docker compose config` was not rerun in the review workspace because the
-  Docker CLI was unavailable; the Compose file itself was not changed.
-- `bash -n scripts/*.sh` passed.
-- `./scripts/validate-cloud-init.sh` passed: 36 passed, 0 failed, including
-  cloud-init-compatible `runcmd` item-type checks and the workspace mount
-  path/order contract.
-- Launch-script help paths exit successfully without requiring Incus.
-- Static lifecycle assertions confirm `incus init` precedes VirtioFS device
-  attachment and `incus start` in both workspace VM scripts.
-- Documentation links to tracked files resolve.
-- Privacy scan found no real hostnames, personal operational usernames,
-  domains, IP addresses, repository URLs, or auth keys. The only personal name
-  retained is the copyright attribution in `LICENSE`.
-- `LICENSE` is present and declares the MIT License.
+The validator parses every cloud-init document, checks that `runcmd` items have
+the types cloud-init accepts, renders each launch template with sample and
+default values and scans for unresolved placeholders, and enforces the workspace
+mount path and ordering contract, the agent install boundary, and the T3 Code
+forward's bind range.
 
-Live Incus image builds, VM launches, container launches, package installs, and
-GPU passthrough were not executed during this static review. The Nextcloud AIO
-stack was not started.
+Properties the static checks establish or the repository maintains:
 
-## Current Findings
+- Launch-script help paths exit successfully without requiring Incus
+  (`./scripts/<name>.sh --help`).
+- `incus init` precedes VirtioFS device attachment and `incus start` in both
+  workspace VM scripts; the validator's mount-contract check asserts this.
+- Relative links in the documentation resolve to tracked files.
+- Tracked documentation and examples use placeholders rather than real
+  hostnames, personal usernames, domains, IP addresses, repository URLs, or auth
+  keys. The only personal name is the copyright attribution in `LICENSE`.
 
-No further obvious correctness or documentation bugs remain from this static
-review. Fixes implemented in this pass:
+None of these runs live Incus image builds, VM or container launches, package
+installs, or GPU passthrough. The Residual Verification Limits section lists
+what that leaves unproven.
 
-- Renamed the four `new-*` scripts without the misleading prefix.
+## Design Properties
+
+The launch and build scripts implement the following:
+
 - Workspace VMs are initialized stopped, receive their VirtioFS project device,
   and only then start. Failed attachment or first start removes the incomplete
   VM.
@@ -58,20 +50,22 @@ review. Fixes implemented in this pass:
 - Re-entry validates any repeated `--git` path, handles frozen VMs, waits for
   cloud-init, and reports bootstrap failures instead of silently entering an
   incomplete VM.
-- The LaTeX image derives from the agents image and inherits Node.js 22, native
-  Claude, and the Codex/Pi installer scripts. Image builds validate those stable
-  prerequisites. Codex and Pi install once in each workspace VM's writable
+- The LaTeX image derives from the agents image and inherits native Claude and
+  the Codex/T3 Code installer scripts. Image builds validate that stable
+  prerequisite. Codex and T3 Code install once in each workspace VM's writable
   filesystem; first boot and re-entry execute every advertised CLI rather than
   merely checking that a launcher exists.
-- Agent images now use Ubuntu's Node 22 packages instead of NodeSource. The
-  agents build removes stale NodeSource state first, so an older base containing
-  Node 24 cannot silently defeat the compatibility constraint. Claude uses
-  Anthropic's signed stable APT channel, Codex uses its supported standalone
-  installer, and Pi uses its official installer rather than direct npm commands.
-  Their payloads are intentionally excluded from published images and installed
-  only during workspace first boot. Pi is explicitly installed under
-  `/usr/local`, outside APT-owned paths. This replaces the previous post-TeX and
-  first-boot repair stack with one installation point and one full verification.
+- Agent images carry no Node.js: Claude is a native package, Codex a standalone
+  binary, and T3 Code a self-contained archive. Claude uses Anthropic's signed
+  stable APT channel, Codex uses its supported standalone installer, and T3 Code
+  uses its release installer, which checks a SHA-256 sum. Their payloads are
+  intentionally excluded from published images and installed only during
+  workspace first boot. T3 Code is installed for the `admin` user and its server
+  runs as a system unit with a pinned listener. `scripts/t3-expose.sh` relays it
+  to the host's tailnet address through a socket bound to that one address; the
+  validator renders its units and checks that it refuses any address outside
+  100.64.0.0/10. This replaces the previous post-TeX and first-boot repair stack
+  with one installation point and one full verification.
 - Image builds run the complete cloud-init validator before launching Incus, so
   YAML, `runcmd` type, and placeholder errors fail locally without creating a
   broken build instance.
@@ -127,13 +121,20 @@ installed Incus version; image and backup relocation are required.
 ### Investigate Incus image-layer executable behavior
 
 The Codex standalone payload repeatedly ran in an image-build VM but segfaulted
-after both derivation and fresh instance launch; Pi's package survived while its
-generated bin link did not. Workspace payloads now avoid image boundaries
-entirely, so functionality no longer depends on diagnosing this behavior. A
-separate host-level investigation could still compare checksums and extents
-across build and launched instances, then review the Incus version, storage
-driver, backing filesystem health, and relevant upstream issues. Changing the
-storage stack is outside this repository simplification.
+after both derivation and fresh instance launch. Workspace payloads now avoid
+image boundaries entirely, so functionality no longer depends on diagnosing this
+behavior. A separate host-level investigation could still compare checksums and
+extents across build and launched instances, then review the Incus version,
+storage driver, backing filesystem health, and relevant upstream issues.
+Changing the storage stack is outside this repository simplification.
+
+The first comparison to make: `build-images.sh` stops the build VM with
+`incus stop --force` before `incus publish`. The Incus reference describes
+`--force` only as "Force the instance to stop" and does not say whether the
+guest is shut down cleanly or powered off, so writes made late in the build may
+not have reached the disk. Stop gracefully (or run `sync` in the guest first),
+publish, and compare `sha256sum /usr/local/bin/codex` in the build VM with an
+instance launched from the published image.
 
 ### Replace the fixed VM password
 
@@ -144,9 +145,9 @@ not folded into a lifecycle bug-fix pass.
 ### Pin and verify external software
 
 Several builds intentionally track moving inputs: the Ubuntu image alias,
-latest `yq`, Pi and Codex releases, TLJH and Ollama installers, OpenWebUI
+latest `yq`, T3 Code and Codex releases, TLJH and Ollama installers, OpenWebUI
 `main`, the Claude Code stable channel, and the Nextcloud AIO `latest` image.
-Node.js is constrained to Ubuntu's 22.x package. Pinning the remaining versions
+Pinning the remaining versions
 and checksums would improve reproducibility and supply-chain control but
 requires a deliberate update policy.
 
@@ -170,9 +171,9 @@ export or backup policy instead of treating every VM as reconstructible.
 
 ## Residual Verification Limits
 
-This review validates shell syntax, ShellCheck, YAML parsing, template
+The static checks validate shell syntax, ShellCheck, YAML parsing, template
 rendering, placeholder replacement, the agent image/first-boot install boundary,
-and documentation consistency. It does not prove that:
+and documentation consistency. They do not prove that:
 - A fresh `incus admin init --preseed` completes on the target host without an
   existing Incus configuration.
 - Incus can launch the configured images/containers on the target host.

@@ -1,229 +1,73 @@
-# Home Server — Setup & Rebuild Reference
+# VM Workspaces — Setup & Rebuild Reference
 
-A single document covering the complete architecture, install order, and
-day-to-day usage of this home server. **Treat this as the disaster-recovery
-runbook**: following it on bare hardware should reproduce the working system.
+Incus installation, image builds, and the persistent VMs and containers that run
+on it: LaTeX and teaching workspaces, agent workspaces, Ollama + OpenWebUI, and
+JupyterHub. The host's own setup (storage layout, Tailscale, Docker, Caddy,
+Nextcloud) is a separate repository, `home-server-provisioning`, with its own
+runbook. Paths such as `./scripts/...`, `config.env`, and `cloud-init/` are
+relative to the repository root.
 
 ---
 
 ## 1. Architecture Summary
 
-A general-purpose Ubuntu Server hosting both user data and virtualization. One
-machine, many workloads, clean isolation where it matters (agents in VMs),
-direct host execution where overhead would be wasted (Nextcloud).
-
-### Hardware
-
-| Component | Spec |
-|---|---|
-| CPU | AMD Ryzen 9 — 12 cores / 24 threads |
-| RAM | 128 GB |
-| GPU | AMD Radeon RX 580 (Polaris, 8 GB VRAM) — Vulkan |
-| Storage | NVMe with LVM (`/` + isolated Incus LV); separate ext4 data SSD at `/data` |
-| Network | Tailscale for host management + optional Jupyter; VMs use host-local Incus networking |
+Per-purpose and per-task VMs plus one system container, all on Incus. Agents run
+in VMs so that they see only explicitly bind-mounted directories.
 
 ### Workloads at a glance
 
 | Workload | Where | Why |
 |---|---|---|
-| **Nextcloud AIO** | Docker on the host | Already-working AIO setup; not worth a VM |
-| **Caddy** | Host service | Reverse proxy for AIO + future web services |
-| **Tailscale** | Host + optional Jupyter container | Management access; not installed in VMs |
 | **JupyterHub (TLJH)** | Incus system container | Lightweight, native install |
 | **Ollama + OpenWebUI** | Incus VM | VM needed for future GPU passthrough; reached by local IP/proxy |
 | **LaTeX workspace (persistent)** | Incus VM | Teaching worksheets; reached via incus exec or host-local SSH |
 | **Agent VMs (persistent)** | Incus VM | Per-task sandbox; reached via incus exec or host-local SSH; no Tailscale |
-| **Nextcloud data** | `/data/ncdata` on the data SSD | AIO data directory via `NEXTCLOUD_DATADIR` |
 | **Git repos** | Host filesystem configured by `GIT_REPOS_ROOT` | Bind-mounted into VMs |
-| **Backups** | Existing off-host backup system | Sync + local incremental + encrypted off-site copies |
 
 ### Architecture diagram
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│  Ubuntu Server 26.04  (ext4)                                             │
+│  Ubuntu host with Incus                                                  │
 │                                                                          │
-│  ┌────────────┐   ┌─────────┐   ┌────────────┐   ┌────────────────┐      │
-│  │ Tailscale  │   │  Caddy  │   │   Docker   │   │     Incus      │      │
-│  │  (host)    │   │ (proxy) │   │            │   │ (VMs + LXCs)   │      │
-│  └────────────┘   └────┬────┘   └──────┬─────┘   └───────┬────────┘      │
-│                        │               │                 │               │
-│                        │               ▼                 │               │
-│                        │      ┌─────────────────┐        │               │
-│                        └──────► Nextcloud AIO   │        │               │
-│                               └─────────────────┘        │               │
-│                                                          │               │
-│   / (host LV) ─────────── Ubuntu + Caddy + Docker          │               │
-│   /srv/incus (Incus LV) ─ VM/container storage ───────────┤               │
-│   /data/ncdata ────────── Nextcloud AIO data              │               │
-│   GIT_REPOS_ROOT ──────── bind-mounted via Incus ─────────┤               │
-│       ├─ teaching-worksheets/                            │               │
-│       ├─ project-foo/                                    │               │
-│       └─ ...                                             │               │
-│                                                          ▼               │
+│   /srv/incus (Incus LV) ─ VM/container storage ───────────┐              │
+│   GIT_REPOS_ROOT ──────── bind-mounted via Incus ─────────┤              │
+│       ├─ teaching-worksheets/                             │              │
+│       ├─ project-foo/                                     │              │
+│       └─ ...                                              │              │
+│                                                           ▼              │
 │   ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────┐       │
 │   │ jupyter      │  │ ollama VM    │  │  latex-ws + agent-* VMs  │       │
 │   │ (LXC, TLJH)  │  │ + OpenWebUI  │  │  (all persistent)        │       │
 │   └──────────────┘  └──────────────┘  └──────────────────────────┘       │
 └──────────────────────────────────────────────────────────────────────────┘
-                                  │
-                                  │  Tailscale(host) + Internet
-                                  ▼
-                ┌──────────────────────────────┐
-                │  Backup host / off-site      │
-                │  storage                     │
-                │  → application-level sync    │
-                │  → local incremental copies  │
-                │  → encrypted off-site copies │
-                └──────────────────────────────┘
 ```
 
 ---
 
-## 2. Bootstrap from Scratch — Disaster Recovery Path
+## 2. Bootstrap
 
-This is the order to follow on fresh hardware to rebuild the working system.
+### 2.1 Prerequisites
 
-### 2.1 Install Ubuntu Server 26.04
+- An Ubuntu Server 26.04 host, installed as described in section 2.1 of the
+  `home-server-provisioning` runbook, with `git` and `python3-yaml` (the latter
+  is used by `./scripts/validate-cloud-init.sh`):
 
-- Download the **Server** ISO (not Desktop) from ubuntu.com
-- During install:
-  - Filesystem: ext4 (current setup) — or ZFS if you choose to reinstall
-    (root-on-ZFS is the installer's "advanced features" option; lets you
-    later add `sanoid`/`syncoid` replication as a VM-level backup tier)
-  - Set up an SSH-enabled admin user (this is your daily-driver account)
-  - Enable OpenSSH server
-- After first boot:
   ```bash
-  sudo apt update && sudo apt full-upgrade -y
-  sudo apt install -y neovim git curl wget htop tmux zsh python3-yaml
-  # python3-yaml is needed by ./scripts/validate-cloud-init.sh
-  chsh -s $(which zsh)        # optional, switch to zsh
+  sudo apt install -y git python3-yaml
   ```
+- A dedicated ext4 filesystem mounted at `/srv/incus`. Incus must not be
+  initialized on the root filesystem: a VM image rebuild can temporarily need
+  both the old and the new image and fill it. The host runbook creates this as
+  a separate logical volume (section 2.2 of the `home-server-provisioning`
+  runbook).
+- A host directory for repositories (`GIT_REPOS_ROOT`, section 2.4 below).
+- This repository on the host; see
+  [Getting the repository onto a host](README.md#getting-the-repository-onto-a-host).
 
-### 2.2 Configure the NVMe LVM layout
+### 2.2 Install and initialize Incus
 
-Ubuntu's guided LVM install can place the full NVMe into a volume group while
-creating only a roughly 100 GiB root logical volume. That is easy to miss:
-`df` shows the small filesystem, while `vgs` shows the unallocated capacity.
-Do not initialize Incus on that small root filesystem. A VM image rebuild can
-temporarily require both the old and new images and fill `/`, which also stops
-Caddy and Docker from writing. Ubuntu's
-[LVM overview](https://documentation.ubuntu.com/server/explanation/storage/about-lvm/)
-explains the physical-volume, volume-group, and logical-volume layers used
-below.
-
-The current target layout is:
-
-| Allocation | Size | Purpose |
-|---|---:|---|
-| `ubuntu-vg/ubuntu-lv` mounted at `/` | 250 GiB | Ubuntu, Caddy, Docker, logs, host tools |
-| `ubuntu-vg/incus-lv` mounted at `/srv/incus` | 1,200 GiB | Incus instances, build VMs, and image caches |
-| Free extents in `ubuntu-vg` | remainder | Online expansion of either LV later |
-| Data SSD mounted at `/data` | full device | Nextcloud data and host Git repositories |
-
-Sizes are targets for this hardware, not universal requirements. On different
-hardware, keep the same separation and leave some volume-group space free.
-
-Inspect the actual device and LVM names before changing anything:
-
-```bash
-lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS
-sudo pvs
-sudo vgs
-sudo lvs -o lv_name,vg_name,lv_size
-```
-
-On the documented layout, grow the installer-created 100 GiB root LV to
-250 GiB. `--resizefs` grows ext4 at the same time and does not require a reboot:
-
-```bash
-sudo lvextend --resizefs --size 250G /dev/ubuntu-vg/ubuntu-lv
-df -hT /
-```
-
-Create the dedicated Incus LV and filesystem. **Run `mkfs.ext4` only on the
-newly created `incus-lv`; formatting an existing LV destroys its contents.**
-
-```bash
-sudo lvcreate --size 1200G --name incus-lv ubuntu-vg
-sudo mkfs.ext4 -L incus /dev/ubuntu-vg/incus-lv
-sudo mkdir -p /srv/incus
-sudo blkid /dev/ubuntu-vg/incus-lv
-```
-
-Add one entry to `/etc/fstab`, using the UUID printed by `blkid`. Either UUID
-form is valid; this runbook follows Ubuntu's `/dev/disk/by-uuid/` style:
-
-```fstab
-/dev/disk/by-uuid/<INCUS_FILESYSTEM_UUID> /srv/incus ext4 defaults,noatime 0 2
-```
-
-Do not paste the complete human-readable `blkid` output into `fstab`; reduce it
-to the single entry above. Validate and mount without rebooting:
-
-```bash
-sudo findmnt --verify --verbose
-sudo systemctl daemon-reload
-sudo mount /srv/incus
-findmnt /srv/incus
-df -h / /srv/incus
-sudo vgs
-```
-
-`findmnt` must show `/srv/incus` backed by `incus-lv` before Incus storage is
-created. A later reboot will mount it automatically.
-
-Mount the separate data SSD at `/data` by UUID as well. If the device already
-contains data, **do not format or repartition it**. Identify the correct ext4
-partition from `lsblk -f` and `blkid`, create the mount point, and add a second
-`fstab` entry:
-
-```bash
-sudo mkdir -p /data
-sudo blkid /dev/sda1
-```
-
-```fstab
-/dev/disk/by-uuid/<DATA_FILESYSTEM_UUID> /data ext4 defaults,noatime 0 2
-```
-
-Then validate and mount it:
-
-```bash
-sudo findmnt --verify --verbose
-sudo systemctl daemon-reload
-sudo mount /data
-findmnt /data
-df -h /data
-```
-
-On replacement hardware with a blank data SSD, partition and format the new
-device only after identifying it unambiguously, then restore the data from
-backup. Never copy a device name such as `/dev/sda` from this runbook without
-checking the target host; enumeration can change between boots and machines.
-
-Both LVs can be expanded online later. Check `vgs` first, then add only the
-required amount, for example:
-
-```bash
-sudo vgs
-sudo lvextend --resizefs --size +100G /dev/ubuntu-vg/incus-lv
-```
-
-### 2.3 Install Tailscale (on the host)
-
-```bash
-curl -fsSL https://tailscale.com/install.sh | sh
-sudo tailscale up --ssh        # --ssh enables Tailscale SSH for this host
-```
-
-Sign in via the URL it prints. From now on you can SSH to this host over
-Tailscale by hostname.
-
-### 2.4 Install and initialize Incus
-
-Ubuntu 26.04 ships Incus in the main repos:
+Ubuntu 26.04 packages Incus in the `universe` component of its archive:
 
 ```bash
 sudo apt install -y incus incus-extra
@@ -343,28 +187,9 @@ incus image copy images:ubuntu/26.04/cloud local: --alias ubuntu-2604-cloud
 # Not strictly required — build-images.sh fetches on demand.
 ```
 
-### 2.5 Install Docker (for Nextcloud AIO)
+### 2.3 Coexist with Docker
 
-Use Docker's official apt repository, not the convenience script.
-
-```bash
-sudo apt-get update
-sudo apt-get install -y ca-certificates curl
-sudo install -m 0755 -d /etc/apt/keyrings
-sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-  -o /etc/apt/keyrings/docker.asc
-sudo chmod a+r /etc/apt/keyrings/docker.asc
-
-echo \
-  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
-  $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" \
-  | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-sudo apt-get update
-sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-sudo usermod -aG docker $USER
-# Log out and back in for group to take effect
-```
+Needed only when the host also runs Docker.
 
 Docker sets the host's forwarding policy to `DROP`. Without an explicit
 exception, Incus guests can receive DHCP leases and resolve DNS through
@@ -393,56 +218,7 @@ sudo iptables -S DOCKER-USER
 incus exec <existing-instance> -- curl -4 -I --connect-timeout 10 https://github.com
 ```
 
-### 2.6 Install Caddy (reverse proxy)
-
-```bash
-sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https
-curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-  | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
-  | sudo tee /etc/apt/sources.list.d/caddy-stable.list
-sudo chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-sudo chmod o+r /etc/apt/sources.list.d/caddy-stable.list
-sudo apt update && sudo apt install -y caddy
-```
-
-The package installs a sample `/etc/caddy/Caddyfile`. Replace the whole file
-with this minimal Caddyfile for Nextcloud AIO and OpenWebUI.
-
-Replace the domains, and replace `<OLLAMA_VM_IP>` with the Incus bridge IP
-from `incus list ollama -c4`. If you later recreate the Ollama VM, re-run
-that command, update the Caddyfile if the IP changed, and reload Caddy.
-
-```caddyfile
-cloud.yourdomain.tld {
-    reverse_proxy 127.0.0.1:11000
-}
-
-ai.yourdomain.tld {
-    reverse_proxy <OLLAMA_VM_IP>:3000
-}
-```
-
-Then format, validate, and reload Caddy:
-
-```bash
-sudo caddy fmt --overwrite /etc/caddy/Caddyfile
-sudo caddy validate --config /etc/caddy/Caddyfile
-sudo systemctl reload caddy
-```
-
-Caddy auto-fetches TLS certificates. Make sure both DNS names point to this
-host and that ports 80/443 are reachable from the internet.
-
-OpenWebUI has its own login flow; the first account created in the web UI
-becomes the admin account. Do **not** expose Ollama's raw `11434` API publicly
-unless you add separate authentication in front of it.
-
-JupyterHub is intentionally **not** included in the public Caddy config. If
-`JUPYTER_TS_AUTHKEY` is set, use its Tailscale name (`http://jupyter/` by
-default) from a Tailscale-connected device.
-
-### 2.7 Configure the host git workspace directory
+### 2.4 Configure the host git workspace directory
 
 `GIT_REPOS_ROOT` is the host-side parent directory for repos when you pass a
 bare name to `--git`. Set it in `config.env` to wherever your SSD storage is
@@ -465,92 +241,7 @@ host path:
 ./scripts/agent-vm.sh refactor-foo --git /mnt/other-ssd/repos/project-foo
 ```
 
-### 2.8 Bring up Nextcloud AIO
-
-Follow the official AIO docs (`https://github.com/nextcloud/all-in-one`).
-The Compose file in this repo follows the official AIO Compose example, with
-Caddy as the public-facing TLS terminator and `/data/ncdata` as the Nextcloud
-data directory.
-
-Before first AIO startup, mount the data SSD at `/data` and confirm it is
-mounted. Do not start AIO while `/data` is missing, otherwise `/data/ncdata`
-could be created on the root filesystem by accident.
-
-```bash
-findmnt /data
-sudo mkdir -p /data/ncdata
-docker compose -f compose/nextcloud-aio.compose.yaml up -d
-```
-
-The ownership is intentional: `/data/ncdata` is the host-side data directory,
-and AIO bind-mounts that same directory into the Nextcloud container as
-`/mnt/ncdata`. The Nextcloud container accesses it as UID `33` (`www-data`),
-and the official AIO docs use GID `0`. On a typical Linux host the directory
-should therefore show up as `www-data:root` / `750` after AIO has initialized
-the instance. Do not chown the whole `/data` mount; AIO should set up
-`/data/ncdata` itself during the initial installation.
-
-After AIO has completed the initial setup, verify the host-side data directory:
-
-```bash
-sudo stat -c '%U:%G %a %n' /data/ncdata
-```
-
-If migrated files are copied into the data directory later, or if files are
-edited manually on disk, re-apply AIO's expected permissions. These commands run
-inside the container but operate on the same host files under `/data/ncdata`
-because `/mnt/ncdata` is the bind mount:
-
-```bash
-sudo docker exec nextcloud-aio-nextcloud chown -R 33:0 /mnt/ncdata/
-sudo docker exec nextcloud-aio-nextcloud chmod -R 750 /mnt/ncdata/
-sudo docker exec --user www-data -it nextcloud-aio-nextcloud php occ files:scan --all
-```
-
-For network filesystems that do not preserve normal Unix ownership, do not use
-ad-hoc host-side permissions. Mount them with ownership/mode options compatible
-with AIO instead, for example `uid=33,gid=0,file_mode=0770,dir_mode=0770` for
-CIFS/SMB.
-
-Then open `https://<host>:8080` (admin UI), complete the setup, point your
-domain at the box, and Caddy will terminate TLS on the public side.
-
-After the Nextcloud container is running, fix the common admin warning about
-the missing default phone region. The value is an ISO 3166-1 alpha-2 country
-code; use `DE` for Germany, or replace it with the country code that matches
-the instance's users:
-
-```bash
-sudo docker exec --user www-data nextcloud-aio-nextcloud php occ config:system:set default_phone_region --value="DE"
-```
-
-`NEXTCLOUD_DATADIR` is set to `/data/ncdata` in the Compose file. Set this only
-before the initial AIO installation; do not change it afterwards unless you are
-following Nextcloud AIO's migration procedure.
-
-After setup, hook up your existing `nextcloudcmd` sync workflow on the
-backup box pointed at the new instance URL.
-
-### 2.9 Get this repository onto the server
-
-This repository (`cloud-init/`, `compose/`, `scripts/`, `config.env`,
-`SETUP.md`) is the source of truth for everything below. Put it on the
-freshly-installed server by whichever path you prefer:
-
-```bash
-# Option A — clone from your git server (Codeberg / GitHub / GitLab / private):
-cd ~/
-git clone <your-URL-for-this-repo> home-server-provisioning
-cd home-server-provisioning
-
-# Option B — rsync from your workstation if you keep it locally:
-rsync -av ~/path/to/home-server-provisioning/ user@server:~/home-server-provisioning/
-```
-
-The point is just "make these files available on the server." Git is the
-clean path; rsync works fine if you don't want to publish this anywhere.
-
-### 2.10 Configure `config.env` and `config.env.local`
+### 2.5 Configure `config.env` and `config.env.local`
 
 There are **two** config files; launch and build scripts source both (`.local`
 second, so it overrides). The validator deliberately reads tracked defaults
@@ -595,27 +286,29 @@ Notes:
   Prefer a one-time, pre-authorized key; launch-time user-data is removed from
   the Incus instance configuration after cloud-init succeeds.
 
-### 2.11 Build the Incus images
+### 2.6 Build the Incus images
 
 ```bash
 ./scripts/build-images.sh
 ```
 
 Images build in dependency order: base → agents → LaTeX. The LaTeX image
-derives from the agents image so it carries Node.js 22, native Claude, and the
-small Codex/Pi installer scripts as well as TeX. Expected timing is base ~10
+derives from the agents image so it carries native Claude and the small Codex
+and T3 Code installer scripts as well as TeX. Expected timing is base ~10
 min, agents ~5 min, and LaTeX ~30-40 min (texlive-full): roughly 50 min total
 for the first run.
 
 Claude Code is installed as a native system package from Anthropic's signed
 stable APT channel. Codex uses its official standalone installer, avoiding
-npm's platform-specific package failure mode. Pi uses its official installer;
-that installer is still npm-backed and therefore keeps Ubuntu's Node.js 22 and
-npm packages as Pi dependencies. Codex and Pi are deliberately not baked into
-published images. Each workspace installs them once during first boot, directly
-into its writable filesystem; Pi's npm prefix is fixed at `/usr/local`.
-Image builds validate Node and Claude, while first boot and every re-entry
-validate the complete Node, Claude, Codex, and Pi stack. New workspace creation
+npm's platform-specific package failure mode. T3 Code uses its release
+installer, which unpacks a self-contained archive after checking its SHA-256 sum
+against the release's checksum file; it needs no language runtime. Codex and T3 Code are
+deliberately not baked into published images. Each workspace installs them once
+during first boot, directly into its writable filesystem: Codex under
+`/usr/local`, T3 Code under the `admin` user's `~/.t3` and `~/.local/bin`, with
+its server run by the `t3code.service` unit (section 3.5).
+Image builds validate Claude, while first boot and every re-entry validate the
+complete Claude, Codex, and T3 Code stack. New workspace creation
 therefore takes a little longer and requires internet access, which is already
 required for UV and dotfiles.
 Package-manager Claude installations do not self-update; a later image rebuild
@@ -660,7 +353,7 @@ that `storage.images_volume` points to a custom volume on that pool. It aborts
 before launching a build if either isolation setting is missing. It also runs
 the repository's cloud-init validator before creating any build VM.
 
-### 2.12 VM login
+### 2.7 VM login
 
 The fixed VM login is:
 
@@ -687,7 +380,7 @@ Passwordless SSH is not configured by these scripts anymore. If you later want
 key-based login, add your public key manually to
 `/home/admin/.ssh/authorized_keys` inside the VM.
 
-### 2.13 Launch the persistent workloads
+### 2.8 Launch the persistent workloads
 
 **LaTeX workspace** (teaching worksheets):
 ```bash
@@ -707,12 +400,12 @@ published TeX repositories kept as separate host directories):
 source ./config.env
 [[ ! -f ./config.env.local ]] || source ./config.env.local
 cd "$GIT_REPOS_ROOT"
-git clone https://github.com/marcschlienger/mtex.git
-git clone https://github.com/marcschlienger/mstuff.git
+git clone https://github.com/<user>/mtex.git
+git clone https://github.com/<user>/mstuff.git
 
-# Then launch from home-server-provisioning. The four default directory names
+# Then launch from vm-provisioning. The four default directory names
 # are teaching-src, teaching-private, mtex, and mstuff.
-cd /path/to/home-server-provisioning
+cd /path/to/vm-provisioning
 # Override any of these with an absolute path in config.env.local when needed.
 ./scripts/teaching-vm.sh teaching-ws
 ```
@@ -751,13 +444,7 @@ with `cd ~/.dotfiles && stow -R teaching-agent`.
 incus exec ollama -- ollama pull llama3.1:8b
 ```
 
-### 2.14 Verify host and VM connectivity
-
-From your workstation:
-```bash
-tailscale status
-ssh <admin-user>@<server-tailscale-hostname>
-```
+### 2.9 Verify VM connectivity
 
 The Jupyter container joins the tailnet only if `JUPYTER_TS_AUTHKEY` is set;
 then visit `http://jupyter/` from a Tailscale-connected device. Guest VMs do
@@ -799,7 +486,7 @@ git pull
 # Inside the VM:
 #   the shell starts in /home/admin/repos
 #   enter teaching-src or teaching-private as needed
-#   run claude, codex, or pi
+#   run claude or codex, or use T3 Code (section 3.5)
 #   build with latexmk -pdf main.tex
 
 # Back on the host, review and push with your own credentials.
@@ -965,30 +652,87 @@ incus stop <name>                             # graceful stop
 incus delete <name>                           # destroy the instance
 ```
 
+### 3.5 Using T3 Code in a workspace VM
+
+LaTeX, teaching, and agent VMs install the T3 Code CLI for the `admin` user at
+first boot and run its server as the `t3code.service` system unit, listening on
+port 3773 on all of the VM's interfaces. The VM's only non-loopback interface is
+the host-private Incus bridge and it has no Tailscale, so the server is reached
+either through the host's tailnet address (the T3 apps) or through an SSH tunnel
+(a browser). Pairing authorizes a device; treat pairing links as passwords.
+
+#### From the T3 apps (iPhone, iPad, Mac)
+
+The host is on your tailnet, so it relays a port of its tailnet address to the
+VM. On the host:
+
+```bash
+sudo ./scripts/t3-expose.sh <vm-name>              # tailnet port 3773
+sudo ./scripts/t3-expose.sh <vm-name> --port 3774  # another VM needs its own port
+```
+
+The script binds the host's tailnet IPv4 address only, never the LAN or a public
+address, and prints the app address, `http://<host-tailnet-ip>:<port>`. Then
+generate a one-time pairing link inside the VM:
+
+```bash
+incus exec <vm-name> -- sudo -u admin -H /home/admin/.local/bin/t3 pair
+```
+
+It prints `http://<vm-address>:3773/pair#token=...`, with the VM's bridge
+address, which your devices cannot reach. Replace `<vm-address>:3773` with the
+tailnet address and port from the script's output, and paste the edited link
+into **Settings → Environments → Add environment** in the app on the device. The
+QR code `t3 pair` prints encodes the unedited address, so paste the link instead
+of scanning it. The link expires after five minutes unless `--ttl` says
+otherwise. The devices must be on the tailnet; the connection is plain HTTP
+carried inside Tailscale's encrypted tunnel, and the last hop stays on the
+host-private bridge.
+
+The forward names the VM's address as a literal. Rerun the script after
+recreating the VM or whenever its address changes, and remove a forward with
+`sudo ./scripts/t3-expose.sh <vm-name> --remove`.
+
+#### From a browser
+
+Tunnel from your workstation through the host to the VM's host-private address
+(`incus list <vm-name> -c4`; the login is in section 2.7):
+
+```bash
+ssh -J <admin-user>@<server-tailscale-hostname> \
+  -L 3773:127.0.0.1:3773 admin@<vm-incusbr0-ip>
+```
+
+Keep that session open and browse to `http://localhost:3773`, pairing with the
+`t3 pair` link from above after replacing `<vm-address>:3773` in it with
+`localhost:3773`. To use more than one VM at once, give each tunnel its own local
+port, for example `-L 3774:127.0.0.1:3773`.
+
+#### Providers, service, updates
+
+T3 Code drives the agent CLIs that are signed in inside the VM, so authenticate
+them there first (`claude auth login`, `codex login`). Both are on the unit's
+`PATH`.
+
+```bash
+incus exec <vm-name> -- systemctl status t3code      # service state
+incus exec <vm-name> -- journalctl -u t3code -n 50   # server log
+```
+
+To move to the newest stable release, rerun the installer, which downloads it
+and re-links `t3`, then restart the unit so the server runs the new version:
+
+```bash
+incus exec <vm-name> -- /usr/local/sbin/install-t3-code
+incus exec <vm-name> -- systemctl restart t3code
+```
+
 ---
 
-## 4. Backups
+## 4. VM State and Backups
 
-Use the existing backup system rather than introducing another backup stack.
-At minimum, preserve independent local and encrypted off-site copies:
-
-| Tier | What | How |
-|---|---|---|
-| Application-level sync | Nextcloud data | Existing Nextcloud-compatible sync workflow |
-| Local incremental | Snapshot of synced data and host repositories | Existing incremental-copy workflow |
-| Off-site copy | Important host data | Encrypted backup to one or more independent providers |
-
-Point the existing backup workflow at the new sources:
-
-- `nextcloudcmd` — update target URL to the AIO instance on this host
-- `rsync` sources — add:
-  - your configured `GIT_REPOS_ROOT` directory (belt-and-suspenders for
-    unpushed agent commits)
-  - `/data/ncdata` for Nextcloud data if your backup workflow does not already
-    cover it through the existing Nextcloud sync path
-  - Jupyter notebook directories (if not already in git)
-- VM state / Ollama models / agent VM filesystems — **skip backup**.
-  These are regenerable from cloud-init + `./build-images.sh`.
+VM filesystems are not backed up. Host-level backups are described in section 3
+of the `home-server-provisioning` runbook.
 
 **Discipline rule for agents (important — VMs are NOT backed up):**
 
@@ -1008,16 +752,6 @@ Specifically:
   covered by the host bind mounts. The default policy treats them as
   disposable. If chat history matters, add an explicit export or backup from
   inside that VM rather than assuming the host backup can see the volume.
-
-### If you later install ZFS root
-
-Add ZFS snapshots + `syncoid` as a **fast VM-level tier**, layered alongside
-the off-host backups rather than replacing them. Install:
-```bash
-sudo apt install sanoid
-# configure /etc/sanoid/sanoid.conf to snapshot ZFS datasets on schedule
-# use syncoid to replicate to backup box
-```
 
 ---
 
@@ -1177,15 +911,16 @@ incus image delete <obsolete-alias-or-fingerprint>
 ```
 
 If root has free LVM extents and only needs emergency headroom, extend it
-online with `lvextend --resizefs`. Use the allocation in section 2.2 rather
-than consuming `100%FREE`, so capacity remains available for the isolated
-Incus LV.
+online with `lvextend --resizefs`. Use the allocation in section 2.2 of the
+`home-server-provisioning` runbook rather than consuming `100%FREE`, so capacity
+remains available for the isolated Incus LV.
 
 ### Migrate an existing root-backed Incus pool
 
 Use this procedure when Incus was initialized before `/srv/incus` existed and
 its `dir` pool source is below `/var/lib/incus`. First complete the LV,
-filesystem, `fstab`, and mount steps in section 2.2. Then create the new pool:
+filesystem, `fstab`, and mount steps in section 2.2 of the
+`home-server-provisioning` runbook. Then create the new pool:
 
 ```bash
 sudo mkdir -p /srv/incus/pool
@@ -1294,7 +1029,7 @@ first boot before replacing one:
 ```bash
 incus exec latex-ws -- cloud-init status --long
 incus exec latex-ws -- tail -n 100 /var/log/cloud-init-output.log
-incus exec latex-ws -- sh -c 'ls -ld /home/admin/.dotfiles; command -v claude codex pi'
+incus exec latex-ws -- sh -c 'ls -ld /home/admin/.dotfiles /home/admin/.local/bin/t3; command -v claude codex'
 ```
 
 For a VM whose cloud-init status is `done`, the instance-local agent installers
@@ -1302,7 +1037,7 @@ can be rerun safely and then verified:
 
 ```bash
 incus exec latex-ws -- /usr/local/sbin/install-codex-cli
-incus exec latex-ws -- /usr/local/sbin/install-pi-cli
+incus exec latex-ws -- /usr/local/sbin/install-t3-code
 incus exec latex-ws -- /usr/local/sbin/verify-agent-clis
 ```
 
@@ -1324,29 +1059,28 @@ incus delete latex-ws
 ./scripts/latex-vm.sh latex-ws --git teaching-worksheets
 ```
 
-### Pi installation fails with `ENOTEMPTY`
+### T3 Code is not reachable
 
-An interrupted or inherited global npm installation can leave Pi's package or
-hidden staging directory below
-`/usr/local/lib/node_modules/@earendil-works`. The current
-`install-pi-cli` removes only those Pi-specific paths before installing, so new
-workspaces recover safely from that state.
-
-If this happened during first boot, cloud-init permanently records the boot as
-failed. For a disposable workspace, update this repository, rebuild the agent
-and dependent LaTeX images, and recreate the VM:
+Inspect the unit, its log, and its listener inside the VM. The server should be
+listening on `127.0.0.1:3773`:
 
 ```bash
-git pull --ff-only
-./scripts/build-images.sh --only agents
-./scripts/build-images.sh --only latex
-incus delete teaching-ws --force
-./scripts/teaching-vm.sh teaching-ws
+incus exec <vm-name> -- systemctl status t3code
+incus exec <vm-name> -- journalctl -u t3code -n 50
+incus exec <vm-name> -- ss -ltn 'sport = :3773'
 ```
 
-The four teaching repositories are host bind mounts, so deleting the failed VM
-does not delete their contents. VM-local credentials and other files are lost;
-preserve them first if the failed VM was not actually disposable.
+`systemctl restart t3code` restarts a stopped server. If the unit file or the
+`t3` binary is missing, the installer is safe to rerun; verify afterwards:
+
+```bash
+incus exec <vm-name> -- /usr/local/sbin/install-t3-code
+incus exec <vm-name> -- /usr/local/sbin/verify-agent-clis
+```
+
+A failed first boot is recorded permanently by cloud-init. Recreate such a VM
+rather than repairing it; the host repositories mounted into it are not deleted
+with it, but VM-local credentials and other files are.
 
 ### Agent VM has no project files
 - Verify the source path exists on host: `ls "$GIT_REPOS_ROOT/<repo>"`, or
@@ -1354,12 +1088,11 @@ preserve them first if the failed VM was not actually disposable.
 - Verify the device was added: `incus config device show <name>`
 - Verify mount inside: `incus exec <name> -- ls /home/admin/project`
 
+
 ---
 
 ## 8. References
 
-- [Ubuntu Server](https://ubuntu.com/server)
-- [Ubuntu LVM guide](https://documentation.ubuntu.com/server/explanation/storage/about-lvm/)
 - [Incus documentation](https://linuxcontainers.org/incus/docs/main/)
 - [Incus initialization and preseed reference](https://linuxcontainers.org/incus/docs/main/reference/manpages/incus/admin/init/)
 - [Incus profiles](https://linuxcontainers.org/incus/docs/main/profiles/)
@@ -1370,46 +1103,45 @@ preserve them first if the failed VM was not actually disposable.
 - [Incus server configuration keys](https://linuxcontainers.org/incus/docs/main/server_config/)
 - [Incus instance and volume migration](https://linuxcontainers.org/incus/docs/main/howto/storage_move_volume/)
 - [Incus image handling and cache](https://linuxcontainers.org/incus/docs/main/image-handling/)
-- Tailscale: https://tailscale.com/kb/
-- Caddy: https://caddyserver.com/docs/
-- Nextcloud AIO: https://github.com/nextcloud/all-in-one
 - TLJH (JupyterHub): https://tljh.jupyter.org/
 - Ollama: https://github.com/ollama/ollama
 - OpenWebUI: https://docs.openwebui.com/
 - vendor-reset: https://github.com/gnif/vendor-reset
-- The backup tools and providers selected for this installation
 
 ---
 
 ## 9. File Layout Reference
 
 ```
-home-server-provisioning/
+vm-provisioning/
 ├── SETUP.md                          ← this file
-├── README.md                         ← short pointer to SETUP.md
+├── README.md                         ← overview and where the two repositories meet
+├── MIGRATION.md                      ← one-time steps for layout and tool changes
 ├── PROJECT_REVIEW.md                 ← static review notes
-├── .gitignore                        ← local cruft to ignore
 ├── config.env                        ← tracked defaults (resources, paths)
 ├── config.env.local                  ← gitignored private overrides (you create it)
-├── compose/
-│   └── nextcloud-aio.compose.yaml     ← AIO mastercontainer config
 ├── cloud-init/
 │   ├── build-base.yaml               ← system tools (NO Tailscale)
-│   ├── build-agents.yaml             ← +Node 22, Claude, Codex/Pi installers
+│   ├── build-agents.yaml             ← Claude, Codex/T3 Code installers
 │   ├── build-latex.yaml              ← agent prerequisites + TeX/PDF tools
-│   ├── launch-init.yaml.tpl          ← VM user, dotfiles, Codex/Pi first boot
+│   ├── launch-init.yaml.tpl          ← VM user, dotfiles, Codex/T3 Code first boot
 │   ├── launch-jupyter.yaml.tpl      ← Jupyter container: optional TS + TLJH
 │   └── launch-ollama.yaml.tpl       ← Ollama VM: password SSH + Ollama + Docker + OpenWebUI
-└── scripts/
-    ├── lib.sh                        ← shared helpers (sourced by most scripts)
-    ├── build-images.sh               ← builds base → agents → LaTeX images
-    ├── validate-cloud-init.sh        ← parses generated cloud-init for all workloads
-    ├── latex-vm.sh                   ← LaTeX workspace + repeatable repo mounts
-    ├── teaching-vm.sh                ← configured three-tree teaching workspace
-    ├── verify-teaching-vm.sh         ← mounts, TEXMF, optional LaTeX build check
-    ├── agent-vm.sh                   ← agent sandbox + repeatable repo mounts
-    ├── jupyter-container.sh          ← TLJH system container
-    └── ollama-vm.sh                  ← Ollama + OpenWebUI VM (CPU-first)
+├── scripts/
+│   ├── lib.sh                        ← shared helpers (sourced by most scripts)
+│   ├── build-images.sh               ← builds base → agents → LaTeX images
+│   ├── validate-cloud-init.sh        ← parses generated cloud-init for all workloads
+│   ├── install-incus-docker-forwarding.sh ← Docker/Incus forwarding integration
+│   ├── t3-expose.sh                  ← forwards a VM's T3 Code onto the host's tailnet address
+│   ├── latex-vm.sh                   ← LaTeX workspace + repeatable repo mounts
+│   ├── teaching-vm.sh                ← configured three-tree teaching workspace
+│   ├── verify-teaching-vm.sh         ← mounts, TEXMF, optional LaTeX build check
+│   ├── agent-vm.sh                   ← agent sandbox + repeatable repo mounts
+│   ├── jupyter-container.sh          ← TLJH system container
+│   └── ollama-vm.sh                  ← Ollama + OpenWebUI VM (CPU-first)
+└── systemd/
+    ├── incus-docker-forward          ← idempotent DOCKER-USER rule helper
+    └── incus-docker-forward.service  ← re-applies the rules after boot and Docker restarts
 ```
 
 (No `profiles/` directory anymore — the agent-isolation profile that masked

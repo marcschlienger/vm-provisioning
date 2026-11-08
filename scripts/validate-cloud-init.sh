@@ -150,7 +150,7 @@ check_agent_install_boundary() {
   for file in "$CI_DIR/build-agents.yaml" "$CI_DIR/build-latex.yaml"; do
     runcmd=$(sed -n '/^runcmd:/,$p' "$file")
     if grep -Fq '/usr/local/sbin/install-codex-cli' <<< "$runcmd" \
-       || grep -Fq '/usr/local/sbin/install-pi-cli' <<< "$runcmd" \
+       || grep -Fq '/usr/local/sbin/install-t3-code' <<< "$runcmd" \
        || ! grep -Fq '/usr/local/sbin/verify-agent-clis --prerequisites' <<< "$runcmd"; then
       valid=false
     fi
@@ -159,31 +159,71 @@ check_agent_install_boundary() {
   if ! awk '
     /^runcmd:/ { in_runcmd = 1; next }
     in_runcmd && $0 == "  - /usr/local/sbin/install-codex-cli" { codex = NR }
-    in_runcmd && $0 == "  - /usr/local/sbin/install-pi-cli" { pi = NR }
+    in_runcmd && $0 == "  - /usr/local/sbin/install-t3-code" { t3 = NR }
     in_runcmd && $0 == "  - /usr/local/sbin/verify-agent-clis" { verify = NR }
-    END { exit !(codex && pi && verify && codex < pi && pi < verify) }
+    END { exit !(codex && t3 && verify && codex < t3 && t3 < verify) }
   ' "$CI_DIR/launch-init.yaml.tpl"; then
     valid=false
   fi
 
-  if grep -Eq 'repair-(codex|pi)' "$CI_DIR/launch-init.yaml.tpl"; then
+  if grep -Eq 'repair-codex' "$CI_DIR/launch-init.yaml.tpl"; then
     valid=false
   fi
 
-  # The instance-local Pi installer must recover from npm's package directory
-  # and hidden staging directory being left behind by an interrupted install.
-  if ! grep -Fq 'rm -rf /usr/local/lib/node_modules/@earendil-works/pi-coding-agent' \
-       "$CI_DIR/build-agents.yaml" \
-     || ! grep -Fq 'rm -rf /usr/local/lib/node_modules/@earendil-works/.pi-coding-agent-*' \
+  # The T3 Code unit must name its listener explicitly. The server's default
+  # bind depends on its mode and LAN settings, and the pairing code is the only
+  # authentication, so the listener must not change by accident. "All
+  # interfaces" inside the VM means its sole non-loopback interface, the
+  # host-private bridge.
+  if ! grep -Fq 'ExecStart=/home/admin/.local/bin/t3 serve --host 0.0.0.0 --port 3773' \
        "$CI_DIR/build-agents.yaml"; then
     valid=false
   fi
 
   if [[ "$valid" == true ]]; then
-    echo "  PASS  agent install boundary  (images: prerequisites; first boot: clean Codex + Pi installs)"
+    echo "  PASS  agent install boundary  (images: prerequisites; first boot: clean Codex + T3 Code installs; T3 Code listener pinned)"
     PASS=$((PASS + 1))
   else
-    echo "  FAIL  agent install boundary  (Codex/Pi must install only during first boot)"
+    echo "  FAIL  agent install boundary  (Codex/T3 Code must install only during first boot; the T3 Code unit must pin its listener)"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+# The host-side forward must bind a tailnet address and nothing else, and must
+# refuse anything outside Tailscale's 100.64.0.0/10 range even when given one.
+check_t3_expose_contract() {
+  local valid=true
+  local script="$SCRIPT_DIR/t3-expose.sh"
+  local rendered address
+
+  rendered=$("$script" sample-vm --print --vm-ip 10.20.30.40 \
+    --tailnet-ip 100.64.1.2 --port 3790 2>/dev/null) || valid=false
+  grep -Fxq 'ListenStream=100.64.1.2:3790' <<< "$rendered" || valid=false
+  grep -Fxq 'FreeBind=yes' <<< "$rendered" || valid=false
+  grep -Fxq 'ExecStart=/usr/lib/systemd/systemd-socket-proxyd 10.20.30.40:3773' \
+    <<< "$rendered" || valid=false
+
+  for address in 100.64.0.1 100.127.255.254; do
+    "$script" sample-vm --print --vm-ip 10.20.30.40 --tailnet-ip "$address" \
+      >/dev/null 2>&1 || valid=false
+  done
+  for address in 0.0.0.0 127.0.0.1 192.168.1.5 10.20.30.40 100.63.255.255 \
+                 100.128.0.1 100.64.1.256 '[::]' ''; do
+    if "$script" sample-vm --print --vm-ip 10.20.30.40 --tailnet-ip "$address" \
+         >/dev/null 2>&1; then
+      valid=false
+    fi
+  done
+  if "$script" sample-vm --print --vm-ip 10.20.30.40 --tailnet-ip 100.64.1.2 \
+       --port 80 >/dev/null 2>&1; then
+    valid=false
+  fi
+
+  if [[ "$valid" == true ]]; then
+    echo "  PASS  t3-expose forward  (tailnet-only socket; non-tailnet addresses and privileged ports refused)"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL  t3-expose forward  (must bind only a 100.64.0.0/10 address on an unprivileged port)"
     FAIL=$((FAIL + 1))
   fi
 }
@@ -250,6 +290,7 @@ for f in "$CI_DIR"/launch-*.yaml.tpl; do
 done
 
 check_agent_install_boundary
+check_t3_expose_contract
 check_workspace_mount_contract
 
 # ── Pass B: generate with SAMPLE values ──────────────────────────────────────
