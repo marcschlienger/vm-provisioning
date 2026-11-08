@@ -712,6 +712,31 @@ Keep that session open and browse to `http://localhost:3773`, pairing with the
 `localhost:3773`. To use more than one VM at once, give each tunnel its own local
 port, for example `-L 3774:127.0.0.1:3773`.
 
+#### Projects
+
+A T3 Code project is a directory on the server. The apps do not add one to a
+remote server; the server's CLI does. On first boot the launchers register the
+project mount (`/home/admin/project`) and every mount below `/home/admin/repos`,
+so the two teaching repositories appear without a step. The TeX trees under
+`/home/admin/texmf` are not registered. A path that is already registered counts
+as success, and a failure only prints a warning with the command to retry.
+
+Registration happens on first run only. For a VM created earlier, or to add
+another directory, run the same command by hand; the path must exist and be a
+directory:
+
+```bash
+incus exec <vm-name> -- sudo -u admin -H /home/admin/.local/bin/t3 project add /home/admin/repos/<name>
+```
+
+Projects are listed under **Settings → Projects** in the app. `t3 project rename
+<path-or-id> "<title>"` renames one, and `t3 project remove <path-or-id>` removes
+it; `--force` on `remove` also deletes the project's threads.
+
+New T3 worktrees are created under the VM's `~/.t3`, so their working files stay
+in the VM, while their commits go to the mounted repository's `.git`. After
+deleting a VM, run `git worktree prune` in the affected host repository.
+
 #### Providers, service, updates
 
 T3 Code drives the agent CLIs that are signed in inside the VM, so authenticate

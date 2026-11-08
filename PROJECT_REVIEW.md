@@ -34,6 +34,12 @@ what that leaves unproven.
 
 The launch and build scripts implement the following:
 
+- First run registers the project mount and the mounts below
+  `/home/admin/repos` as T3 Code projects, never the TeX trees. It is
+  best-effort: an already-registered path counts as success and any other
+  failure warns with the retry command instead of stopping the launcher. The
+  validator exercises the helper with a stubbed `incus` and checks both launchers
+  set the list before waiting for the VM.
 - Image builds run `sync` in the guest and stop it cleanly before publishing,
   forcing the stop only if that times out. Each published image is then booted
   and checked for empty systemd unit files, a leftover package-manager journal,

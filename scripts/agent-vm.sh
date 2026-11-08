@@ -19,7 +19,8 @@
 #
 # Behaviour:
 #   - First run: creates the VM, mounts the project, waits for cloud-init,
-#     drops you into a shell.
+#     drops you into a shell. The project and every mount below /home/admin/repos
+#     are registered as T3 Code projects (a warning, not an error, if that fails).
 #   - Re-entry: re-enters the SAME VM with all state intact.
 #       * stopped VM  -> started, then attached
 #       * running VM  -> attached (new shell alongside any existing session)
@@ -49,7 +50,7 @@ GIT_ARG=""
 MOUNT_SPECS=()
 
 die()   { echo "ERROR: $*" >&2; exit 1; }
-usage() { sed -n '2,38p' "$0"; }
+usage() { sed -n '2,39p' "$0"; }
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -188,4 +189,15 @@ fi
 echo "Re-enter any time with:  ./scripts/agent-vm.sh $TASK"
 echo "Or SSH from the host:    ssh admin@\$(incus list $NAME -c4 --format csv | cut -d' ' -f1)"
 echo ""
+
+# Repositories to register as T3 Code projects once the VM is ready: the primary
+# project and every extra mount below /home/admin/repos. TeX trees are not projects.
+WORKSPACE_T3_PROJECTS=""
+[[ -z "$HOST_PROJECT" ]] || WORKSPACE_T3_PROJECTS="/home/admin/project"
+for target in "${EXTRA_MOUNT_TARGETS[@]}"; do
+  case "$target" in
+    /home/admin/repos/*) WORKSPACE_T3_PROJECTS="${WORKSPACE_T3_PROJECTS:+$WORKSPACE_T3_PROJECTS }$target" ;;
+  esac
+done
+
 wait_and_enter "$NAME"

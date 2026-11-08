@@ -262,6 +262,82 @@ check_image_capture_contract() {
   fi
 }
 
+# Workspace repositories are registered as T3 Code projects after first boot.
+# Registration must never stop a launcher: an existing registration counts as
+# success and any other failure only warns. Both launchers must set the list
+# before waiting for the VM, and TeX trees must stay out of it.
+check_t3_projects_contract() {
+  local valid=true
+  local launcher set_line wait_line output
+
+  output=$(
+    WORKSPACE_T3_PROJECTS="/home/admin/repos/one /home/admin/repos/two /home/admin/project"
+    WORKSPACE_T3_READY_SECONDS=0
+    incus() {
+      if [[ "$*" == *"project add /home/admin/repos/two"* ]]; then
+        echo "An active project already exists for '/home/admin/repos/two'."
+        return 1
+      elif [[ "$*" == *"project add /home/admin/project"* ]]; then
+        echo "boom"
+        return 1
+      fi
+      return 0
+    }
+    register_t3_projects sample-vm 2>&1
+    echo "rc=$?"
+  )
+  grep -Fq 'T3 Code project added: /home/admin/repos/one' <<< "$output" || valid=false
+  grep -Fq 'T3 Code project already registered: /home/admin/repos/two' <<< "$output" || valid=false
+  grep -Fq "WARNING: could not add '/home/admin/project'" <<< "$output" || valid=false
+  grep -Fq 'Retry: incus exec sample-vm' <<< "$output" || valid=false
+  grep -Fxq 'rc=0' <<< "$output" || valid=false
+
+  output=$(WORKSPACE_T3_PROJECTS=""; register_t3_projects sample-vm 2>&1; echo "rc=$?")
+  [[ "$output" == "rc=0" ]] || valid=false
+
+  output=$(
+    WORKSPACE_T3_PROJECTS="/home/admin/repos/one"
+    WORKSPACE_T3_READY_SECONDS=0
+    incus() { return 1; }
+    register_t3_projects sample-vm 2>&1
+    echo "rc=$?"
+  )
+  { grep -Fq 'T3 Code is not installed' <<< "$output" && grep -Fxq 'rc=0' <<< "$output"; } \
+    || valid=false
+
+  for launcher in "$SCRIPT_DIR/latex-vm.sh" "$SCRIPT_DIR/agent-vm.sh"; do
+    set_line=$(grep -nF -m1 "WORKSPACE_T3_PROJECTS=\"\"" "$launcher" | cut -d: -f1 || true)
+    wait_line=$(grep -nF -m1 "wait_and_enter \"\$NAME\"" "$launcher" | cut -d: -f1 || true)
+    if [[ -z "$set_line" || -z "$wait_line" ]] || (( set_line >= wait_line )); then
+      valid=false
+      continue
+    fi
+    grep -Fq '/home/admin/repos/*)' "$launcher" || valid=false
+    if sed -n "${set_line},${wait_line}p" "$launcher" | grep -Fq 'texmf'; then
+      valid=false
+    fi
+  done
+
+  # The first-run path must actually call the helper, before it hands over the shell.
+  if ! awk '
+    /^wait_and_enter\(\) \{/ { inside = 1; next }
+    inside && /^}/ { inside = 0 }
+    inside && /register_t3_projects "\$instance"/ { registered = NR }
+    inside && /enter_workspace_shell "\$instance"/ { entered = NR }
+    END { exit !(registered && entered && registered < entered) }
+  ' "$SCRIPT_DIR/lib.sh"; then
+    valid=false
+  fi
+
+  if [[ "$valid" == true ]]; then
+    echo "  PASS  T3 project registration  (best-effort and idempotent; both launchers list repos, never TeX trees, before waiting)"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL  T3 project registration  (must never stop a launcher, must accept an existing project, and must list only repos)"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
 check_workspace_mount_contract() {
   local valid=true
   local launcher init_line project_line extra_line start_line bad_spec
@@ -326,6 +402,7 @@ done
 check_agent_install_boundary
 check_t3_expose_contract
 check_image_capture_contract
+check_t3_projects_contract
 check_workspace_mount_contract
 
 # ── Pass B: generate with SAMPLE values ──────────────────────────────────────

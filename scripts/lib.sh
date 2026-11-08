@@ -403,6 +403,50 @@ enter_workspace_shell() {
     /usr/bin/zsh -il
 }
 
+# Register the workspace's repositories as T3 Code projects. The launcher lists
+# the guest paths, space-separated, in WORKSPACE_T3_PROJECTS. This is a
+# convenience, not provisioning: a failure warns with the retry command and
+# never stops the launcher, and a path that is already registered counts as
+# success. `t3 project add` uses the running server's API, or opens the database
+# directly when no server answers; waiting for the server first avoids the
+# second case. WORKSPACE_T3_READY_SECONDS bounds that wait (default 30).
+# Usage:  register_t3_projects <instance>
+register_t3_projects() {
+  local instance="$1"
+  local t3=/home/admin/.local/bin/t3
+  local ready_seconds="${WORKSPACE_T3_READY_SECONDS:-30}"
+  local waited=0
+  local paths project_path output
+
+  read -r -a paths <<< "${WORKSPACE_T3_PROJECTS:-}"
+  (( ${#paths[@]} > 0 )) || return 0
+
+  if ! incus exec "$instance" -- test -x "$t3"; then
+    echo "NOTE: T3 Code is not installed in '$instance'; skipping project registration." >&2
+    return 0
+  fi
+
+  until incus exec "$instance" -- curl -fsS -o /dev/null --max-time 2 \
+      http://127.0.0.1:3773/.well-known/t3/environment 2>/dev/null; do
+    (( waited < ready_seconds )) || break
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  for project_path in "${paths[@]}"; do
+    if output=$(incus exec "$instance" -- sudo -u admin -H "$t3" project add "$project_path" 2>&1); then
+      echo "==> T3 Code project added: $project_path"
+    elif [[ "$output" == *"An active project already exists"* ]]; then
+      echo "==> T3 Code project already registered: $project_path"
+    else
+      echo "WARNING: could not add '$project_path' as a T3 Code project:" >&2
+      printf '         %s\n' "$output" >&2
+      echo "         Retry: incus exec $instance -- sudo -u admin -H $t3 project add $project_path" >&2
+    fi
+  done
+  return 0
+}
+
 # Combined wait then enter as the fixed admin VM user. Used after first-run creation.
 # Usage:  wait_and_enter <instance> [texmf-home] [tex-input-to-verify]...
 wait_and_enter() {
@@ -421,6 +465,7 @@ wait_and_enter() {
     verify_tex_input "$instance" "$tex_input" "$texmf_home" \
       || { echo "ERROR: TeX input verification failed." >&2; exit 1; }
   done
+  register_t3_projects "$instance"
   clear_instance_user_data "$instance"
   enter_workspace_shell "$instance"
 }
