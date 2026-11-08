@@ -11,7 +11,8 @@
 #   1. Ensure the fixed admin VM login user exists
 #   2. Enable password SSH for that user (admin/admin)
 #   3. Clone + apply dotfiles
-#   4. Install Codex and T3 Code once in the VM's writable filesystem
+#   4. Link the dotfiles' shared skills into the directory Claude Code reads
+#   5. Install Codex and T3 Code once in the VM's writable filesystem
 #
 # Placeholders substituted by the launch scripts before launch:
 #   __DOTFILES_REPO__    git URL of dotfiles repo (may be empty)
@@ -86,6 +87,16 @@ runcmd:
         'cd ~/.dotfiles && __INSTALL_CMD__';
     fi
   - test -d /home/admin/.dotfiles
+
+  # ── Agent skills ───────────────────────────────────────────────────────────
+  # Dotfiles install shared skills in ~/.agents/skills, the directory Codex
+  # reads. Claude Code reads ~/.claude/skills instead, so link each skill there
+  # the way a workstation does. Nothing happens when the dotfiles carry none.
+  - >-
+    sudo -u admin env HOME=/home/admin sh -c
+    'if [ -d ~/.agents/skills ]; then mkdir -p ~/.claude/skills;
+    for d in ~/.agents/skills/*/; do [ -d "$d" ] || continue; n=$(basename "$d");
+    ln -sfn "../../.agents/skills/$n" ~/.claude/skills/"$n"; done; fi'
 
   # ── Per-instance agent CLIs ────────────────────────────────────────────────
   # These payloads live only in the VM's writable filesystem. A standalone Codex

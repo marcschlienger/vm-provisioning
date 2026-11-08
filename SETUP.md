@@ -430,9 +430,20 @@ The launcher sets `TEXMFHOME` to the two complete TDS trees, then verifies the
 Nextcloud is not mounted into the teaching workspace.
 
 The dotfiles repository contains the shared skills as the `teaching-agent`
-Stow package. New VMs install it automatically through the default `stow */`.
-After updating an existing VM's dotfiles clone, expose the new package once
-with `cd ~/.dotfiles && stow -R teaching-agent`.
+Stow package. It installs them in `~/.agents/skills`, the directory Codex reads.
+Claude Code reads `~/.claude/skills` instead, so first boot also links each
+skill there, as on a workstation. New VMs get both through the default
+`stow */`. After updating an existing VM's dotfiles clone, expose the new
+package once with `cd ~/.dotfiles && stow -R teaching-agent`.
+
+For a VM created before that step existed, or after adding a skill to the
+package, link the skills for Claude Code by hand. The command is safe to repeat,
+and a running Claude Code session may need a restart to see a newly created
+skills directory:
+
+```bash
+incus exec teaching-ws -- sudo -u admin -H sh -c 'mkdir -p ~/.claude/skills; for d in ~/.agents/skills/*/; do [ -d "$d" ] || continue; n=$(basename "$d"); ln -sfn "../../.agents/skills/$n" ~/.claude/skills/"$n"; done'
+```
 
 **JupyterHub** (small group / personal):
 ```bash
@@ -570,7 +581,8 @@ incus exec teaching-ws -- su - admin -c \
 
 Skills are symlinked from `~/.dotfiles`, so edits to an already-stowed skill
 take effect after the pull. Re-stowing also creates links for newly added
-packages or paths. Re-enter the VM to start a fresh login shell when shell
+packages or paths; a newly added skill still needs the Claude Code link command
+above. Re-enter the VM to start a fresh login shell when shell
 configuration changed.
 
 Rebuilding a published image alone never updates an existing VM. Recreate a

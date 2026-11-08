@@ -338,6 +338,84 @@ check_t3_projects_contract() {
   fi
 }
 
+# Print the first runcmd string in $1 that contains $2.
+runcmd_item_containing() {
+  local file="$1"
+  local needle="$2"
+  if command -v python3 >/dev/null 2>&1 \
+     && python3 -c 'import yaml' 2>/dev/null; then
+    python3 -c '
+import sys, yaml
+doc = yaml.safe_load(open(sys.argv[1])) or {}
+for item in doc.get("runcmd", []):
+    if isinstance(item, str) and sys.argv[2] in item:
+        print(item)
+        break
+' "$file" "$needle"
+  elif command -v ruby >/dev/null 2>&1; then
+    ruby -ryaml -e '
+doc = YAML.safe_load(File.read(ARGV[0])) || {}
+item = (doc["runcmd"] || []).find { |i| i.is_a?(String) && i.include?(ARGV[1]) }
+puts item if item
+' "$file" "$needle"
+  else
+    die "Need python3+PyYAML or ruby to read runcmd items."
+  fi
+}
+
+# The first-boot skills step must link every skill the dotfiles installed in
+# ~/.agents/skills into ~/.claude/skills, be safe to repeat, and do nothing when
+# there are none. The template's own command runs against a scratch home.
+check_agent_skills_link() {
+  local valid=true
+  local prefix="sudo -u admin env HOME=/home/admin "
+  local scratch rendered cmd home
+
+  scratch=$(mktemp -d)
+  rendered="$scratch/launch-init.yaml"
+  render_template "$CI_DIR/launch-init.yaml.tpl" \
+    DOTFILES_REPO="https://github.com/example/dotfiles.git" \
+    INSTALL_CMD="stow */" > "$rendered"
+  cmd=$(runcmd_item_containing "$rendered" ".agents/skills")
+
+  if [[ -z "$cmd" || "$cmd" != "$prefix"* ]]; then
+    valid=false
+  else
+    cmd="env HOME=__HOME__ ${cmd#"$prefix"}"
+
+    home="$scratch/with-skills"
+    mkdir -p "$home/.agents/skills/alpha" "$home/.agents/skills/beta"
+    echo alpha > "$home/.agents/skills/alpha/SKILL.md"
+    echo beta > "$home/.agents/skills/beta/SKILL.md"
+    echo "not a skill" > "$home/.agents/skills/README"
+    sh -c "${cmd//__HOME__/$home}" >/dev/null 2>&1 || valid=false
+    sh -c "${cmd//__HOME__/$home}" >/dev/null 2>&1 || valid=false
+    [[ -L "$home/.claude/skills/alpha" && -L "$home/.claude/skills/beta" ]] || valid=false
+    [[ "$(cat "$home/.claude/skills/alpha/SKILL.md" 2>/dev/null)" == alpha ]] || valid=false
+    [[ "$(cat "$home/.claude/skills/beta/SKILL.md" 2>/dev/null)" == beta ]] || valid=false
+    [[ "$(find "$home/.claude/skills" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" == 2 ]] || valid=false
+
+    home="$scratch/empty-skills"
+    mkdir -p "$home/.agents/skills"
+    sh -c "${cmd//__HOME__/$home}" >/dev/null 2>&1 || valid=false
+    [[ -z "$(ls -A "$home/.claude/skills" 2>/dev/null)" ]] || valid=false
+
+    home="$scratch/no-skills"
+    mkdir -p "$home"
+    sh -c "${cmd//__HOME__/$home}" >/dev/null 2>&1 || valid=false
+    [[ ! -e "$home/.claude" ]] || valid=false
+  fi
+  rm -rf "$scratch"
+
+  if [[ "$valid" == true ]]; then
+    echo "  PASS  agent skills link  (each ~/.agents/skills entry linked into ~/.claude/skills; repeatable; a no-op without skills)"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL  agent skills link  (first boot must link every skill for Claude Code, repeatably, and do nothing without skills)"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
 check_workspace_mount_contract() {
   local valid=true
   local launcher init_line project_line extra_line start_line bad_spec
@@ -403,6 +481,7 @@ check_agent_install_boundary
 check_t3_expose_contract
 check_image_capture_contract
 check_t3_projects_contract
+check_agent_skills_link
 check_workspace_mount_contract
 
 # ── Pass B: generate with SAMPLE values ──────────────────────────────────────

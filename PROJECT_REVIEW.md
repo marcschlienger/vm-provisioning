@@ -34,6 +34,10 @@ what that leaves unproven.
 
 The launch and build scripts implement the following:
 
+- First boot links each skill the dotfiles install in `~/.agents/skills` (the
+  directory Codex reads) into `~/.claude/skills` (the directory Claude Code
+  reads), and does nothing when the dotfiles carry no skills. The validator runs
+  the template's own command against scratch home directories.
 - First run registers the project mount and the mounts below
   `/home/admin/repos` as T3 Code projects, never the TeX trees. It is
   best-effort: an already-registered path counts as success and any other
