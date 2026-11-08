@@ -337,10 +337,14 @@ Monitor both failure domains during a build:
 watch -n 5 'df -h / /srv/incus'
 ```
 
-The script preserves the previous aliased image until its replacement has been
-published successfully. After a successful rebuild, `incus image list` can
-therefore contain an older image with a blank alias. Once the replacement is
-verified, delete only the identified obsolete fingerprint through Incus:
+The script syncs and cleanly stops each build VM before publishing, then boots a
+throwaway VM from the published image and checks it for empty systemd unit files
+and a damaged package database. It preserves the previous aliased image until
+its replacement has been published and has passed that check; a failing image
+keeps the old alias and the build VM. After a successful rebuild, `incus image
+list` can therefore contain an older image with a blank alias. Once the
+replacement is verified, delete only the identified obsolete fingerprint
+through Incus:
 
 ```bash
 incus image list
@@ -995,6 +999,27 @@ already removed. The Incus daemon's small database and network state remain in
 # build-images.sh now dumps the tail of the cloud-init log on failure.
 # Manually inspect a build VM if it's still around:
 incus exec build-base-<timestamp> -- cat /var/log/cloud-init-output.log
+```
+
+### A VM's first boot fails with `ssh.service is masked` or dpkg errors
+
+The image the VM was created from was captured with data missing. systemd treats
+an empty (zero-byte) unit file as masked, so the first-boot SSH step cannot
+reload `ssh`, and `dpkg` may fail to read its own journal. Confirm inside the
+failed VM; any output from either command means the image is damaged:
+
+```bash
+incus exec <vm-name> -- find /usr/lib/systemd/system -type f -size 0
+incus exec <vm-name> -- ls -A /var/lib/dpkg/updates
+```
+
+`build-images.sh` syncs and stops the build VM cleanly before publishing and
+refuses to promote an image that fails these checks. Rebuild with the current
+script, all three images and base first because each derives from the one
+before, then recreate the VM:
+
+```bash
+./scripts/build-images.sh
 ```
 
 ### Incus VM has no network

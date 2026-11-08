@@ -34,6 +34,12 @@ what that leaves unproven.
 
 The launch and build scripts implement the following:
 
+- Image builds run `sync` in the guest and stop it cleanly before publishing,
+  forcing the stop only if that times out. Each published image is then booted
+  and checked for empty systemd unit files, a leftover package-manager journal,
+  and an unreadable or inconsistent package database before its alias is
+  promoted; a failing image leaves the previous alias in place and keeps the
+  build VM. The validator asserts this ordering.
 - Workspace VMs are initialized stopped, receive their VirtioFS project device,
   and only then start. Failed attachment or first start removes the incomplete
   VM.
@@ -128,13 +134,18 @@ extents across build and launched instances, then review the Incus version,
 storage driver, backing filesystem health, and relevant upstream issues.
 Changing the storage stack is outside this repository simplification.
 
-The first comparison to make: `build-images.sh` stops the build VM with
-`incus stop --force` before `incus publish`. The Incus reference describes
-`--force` only as "Force the instance to stop" and does not say whether the
-guest is shut down cleanly or powered off, so writes made late in the build may
-not have reached the disk. Stop gracefully (or run `sync` in the guest first),
-publish, and compare `sha256sum /usr/local/bin/codex` in the build VM with an
-instance launched from the published image.
+An image published from a force-stopped build VM has been seen to boot with
+every `openssh-server` unit file at zero bytes (systemd treats an empty unit as
+masked, so the first-boot SSH step failed) and with a package-manager journal
+caught mid-run. Names, sizes, and times intact with the data missing is what
+ext4's delayed allocation leaves behind when writes from the last seconds before
+a power-off never reach the disk. The Incus reference describes
+`incus stop --force` only as "Force the instance to stop". `build-images.sh`
+therefore runs `sync` in the guest and stops it cleanly, forcing only if that
+times out, and boots each published image to check it before promoting its
+alias. Whether the same mechanism explains the Codex crash above is untested;
+compare `sha256sum /usr/local/bin/codex` in a build VM with an instance
+launched from the published image.
 
 ### Replace the fixed VM password
 

@@ -228,6 +228,40 @@ check_t3_expose_contract() {
   fi
 }
 
+# Images must be captured after a flush and a clean stop, and each published
+# image must be boot-tested before its alias is promoted. Forcing the stop is
+# only a fallback and must come after the clean attempt.
+check_image_capture_contract() {
+  local valid=true
+  local script="$SCRIPT_DIR/build-images.sh"
+  local sync_line stop_line force_line publish_line verify_line promote_line
+
+  sync_line=$(grep -nF -m1 "incus exec \"\$instance\" -- sync" "$script" | cut -d: -f1 || true)
+  stop_line=$(grep -nF -m1 "incus stop \"\$instance\" --timeout" "$script" | cut -d: -f1 || true)
+  force_line=$(grep -nF -m1 "incus stop \"\$instance\" --force" "$script" | cut -d: -f1 || true)
+  publish_line=$(grep -nF -m1 "incus publish \"\$instance\"" "$script" | cut -d: -f1 || true)
+  verify_line=$(grep -nF -m1 "verify_published_image \"\$temp_alias\"" "$script" | cut -d: -f1 || true)
+  promote_line=$(grep -nF -m1 "incus image alias rename \"\$temp_alias\"" "$script" | cut -d: -f1 || true)
+
+  if [[ -z "$sync_line" || -z "$stop_line" || -z "$publish_line" \
+        || -z "$verify_line" || -z "$promote_line" ]] \
+     || (( sync_line >= stop_line || stop_line >= publish_line \
+           || publish_line >= verify_line || verify_line >= promote_line )); then
+    valid=false
+  fi
+  if [[ -n "$force_line" ]] && { [[ -z "$stop_line" ]] || (( force_line <= stop_line )); }; then
+    valid=false
+  fi
+
+  if [[ "$valid" == true ]]; then
+    echo "  PASS  image capture contract  (sync, clean stop, publish, boot check, promote; forced stop only as fallback)"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL  image capture contract  (build-images.sh must sync and stop cleanly before publishing, and boot-check before promoting)"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
 check_workspace_mount_contract() {
   local valid=true
   local launcher init_line project_line extra_line start_line bad_spec
@@ -291,6 +325,7 @@ done
 
 check_agent_install_boundary
 check_t3_expose_contract
+check_image_capture_contract
 check_workspace_mount_contract
 
 # ── Pass B: generate with SAMPLE values ──────────────────────────────────────

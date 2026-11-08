@@ -83,6 +83,64 @@ alias_fingerprint() {
     | awk -F, -v alias="$alias_short" '$1 == alias { print $2; exit }'
 }
 
+# ── Published-image check ─────────────────────────────────────────────────────
+# Boot a throwaway VM from a just-published image and look for the damage an
+# image captured without a clean shutdown carries: files that exist with their
+# name, size, and times but no data (systemd treats an empty unit file as
+# masked), and a package-manager journal caught mid-run. Returns non-zero when a
+# check fails. The throwaway VM is always deleted.
+verify_published_image() {
+  local image_alias="$1"
+  local disk_size="$2"
+  local probe="verify-${image_alias}-${TIMESTAMP}"
+  local result=0
+  local checks
+
+  checks=$(cat <<'EOF'
+bad=0
+empty=$(find /usr/lib/systemd/system -type f -size 0)
+if [ -n "$empty" ]; then
+  echo "empty systemd unit files:"
+  echo "$empty"
+  bad=1
+fi
+if [ -n "$(ls -A /var/lib/dpkg/updates)" ]; then
+  echo "dpkg update journal is not empty:"
+  ls -l /var/lib/dpkg/updates
+  bad=1
+fi
+if ! dpkg -l >/dev/null 2>&1; then
+  echo "dpkg cannot read its package database"
+  bad=1
+fi
+audit=$(dpkg --audit 2>&1)
+if [ -n "$audit" ]; then
+  echo "dpkg --audit reports:"
+  echo "$audit"
+  bad=1
+fi
+exit "$bad"
+EOF
+)
+
+  step "Verifying published image: $image_alias"
+  incus launch "local:${image_alias}" "$probe" \
+    --vm \
+    --storage "$INCUS_STORAGE_POOL" \
+    --config limits.cpu=2 \
+    --config limits.memory=2GiB \
+    --device "root,size=${disk_size}" >/dev/null \
+    || { echo "ERROR: could not launch a verification VM from '$image_alias'." >&2; return 1; }
+
+  if wait_for_instance "$probe" 600; then
+    incus exec "$probe" -- sh -c "$checks" || result=1
+  else
+    result=1
+  fi
+  incus delete "$probe" --force >/dev/null 2>&1 || true
+  return "$result"
+}
+
 # ── Core build + publish routine ──────────────────────────────────────────────
 build_and_publish() {
   local instance="$1"
@@ -110,8 +168,17 @@ build_and_publish() {
   info "Cleaning cloud-init state for a clean snapshot..."
   incus exec "$instance" -- cloud-init clean --logs
 
-  info "Stopping instance..."
-  incus stop "$instance" --force
+  # Flush the guest's dirty pages, then shut it down cleanly. A forced stop
+  # discards writes still in the guest's page cache: files created in the last
+  # ~30 seconds keep their name, size, and times but lose their data, and the
+  # package database can be captured mid-run. Force only if the clean shutdown
+  # times out; the data was synced first.
+  info "Syncing and stopping instance..."
+  incus exec "$instance" -- sync
+  if ! incus stop "$instance" --timeout 300; then
+    echo "WARNING: clean shutdown of '$instance' failed; forcing the stop (data was synced first)." >&2
+    incus stop "$instance" --force
+  fi
 
   # Publish to a temp alias FIRST so a failure here leaves the previous good
   # alias intact. Only after publish succeeds do we swap the canonical alias.
@@ -124,6 +191,9 @@ build_and_publish() {
 
   info "Publishing to temporary alias: $temp_alias"
   incus publish "$instance" --alias "$temp_alias"
+
+  verify_published_image "$temp_alias" "$disk_size" \
+    || die "Published image '$temp_alias' failed verification (findings above). '$alias_short' is unchanged and build instance '$instance' was kept. If the findings are false positives, promote by hand: incus image alias delete $alias_short; incus image alias rename $temp_alias $alias_short"
 
   # Swap: drop old canonical alias (if present), then rename temp to canonical.
   # If the rename fails after the delete, restore the old alias when possible.
